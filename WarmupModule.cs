@@ -3,9 +3,12 @@ using System.Configuration;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Web;
+using System.Web.Mvc;
+using System.Web.SessionState;
 
 namespace EPiServer.Warmup
 {
@@ -27,13 +30,12 @@ namespace EPiServer.Warmup
         private void Context_BeginRequest(object sender, EventArgs e)
         {
             var app = sender as HttpApplication;
-            if (app.Request.UserAgent == "SiteWarmup")
+            if (app.Request.UserAgent == "AlwaysOn")
             {
                 if (Interlocked.CompareExchange(ref _started, DateTime.Now, null)== null)
                 {
                     Func<string, string> performRequest = (u) =>
                     {
-                        HttpStatusCode status;
                         StringBuilder sb = new StringBuilder();
                         sb.Append(u);
                         sb.Append('\t');
@@ -41,17 +43,16 @@ namespace EPiServer.Warmup
                         {
                             Stopwatch timeTaken = new Stopwatch();
                             timeTaken.Start();
-                            status = ExecuteWarmupRequest(new Uri(app.Request.Url, u));
+                            
+                            ExecuteWarmupRequest(app.Context, new Uri(app.Request.Url, u));
                             timeTaken.Stop();
-                            sb.Append(status);
-                            sb.Append('\t');
                             sb.Append(timeTaken.Elapsed.ToString());
                         }
                         catch (Exception ex)
                         {
                             sb.Append("FAILED");
                             sb.Append('\t');
-                            sb.Append(ex.Message);
+                            sb.Append(ex.ToString());
                         }
                         return sb.ToString();
                     };
@@ -112,35 +113,60 @@ namespace EPiServer.Warmup
             }
         }
 
-        private HttpStatusCode ExecuteWarmupRequest(Uri uri)
+        /// <summary>
+        /// Executes a request through the pipeline
+        /// </summary>
+        /// <param name="thisContext"></param>
+        /// <param name="uri"></param>
+        private void ExecuteWarmupRequest(HttpContext thisContext, Uri uri)
         {
-            UriBuilder ub = new UriBuilder(uri);
-            ub.Host = "127.0.0.1";
-            var req = WebRequest.Create(ub.Uri) as HttpWebRequest;
-            if (req == null)
-                return 0;
-
-            req.Timeout = 300000;
-            req.Host = uri.Host;
-            HttpWebResponse resp;
-            try
+            var request = new HttpRequest(null, uri.Scheme + "://" + uri.Authority + uri.AbsolutePath, string.IsNullOrWhiteSpace(uri.Query) ? null : uri.Query.Substring(1));
+            using (var sw = new StringWriter())
             {
-                resp = req.GetResponse() as HttpWebResponse;
-            }
-            catch (WebException wex)
-            {
-                if (wex.Response == null || wex.Status != WebExceptionStatus.ProtocolError)
-                    throw;
+                var response = new HttpResponse(sw);
+                var context = new HttpContext(request, response);
 
-                resp = wex.Response as HttpWebResponse;
-            }
+                // Set up an anonymous identity to prevent NullReferenceExceptions carelessly accessing HttpContext.Current.User.Identity
+                context.User = new GenericPrincipal(new GenericIdentity(""), new string[] { });
 
-            if (resp == null)
-                return 0;
+                // Required to be able to call Global.asax's GetVaryByCustomString from the OutputCacheAttribute
+                context.ApplicationInstance = thisContext.ApplicationInstance;
 
-            using (resp)
-            {
-                return resp.StatusCode;
+                // If the application requires session state, provide it.
+                var sessionContainer = new HttpSessionStateContainer("id",
+                    new SessionStateItemCollection(),
+                    new HttpStaticObjectsCollection(),
+                    10, true,
+                    HttpCookieMode.AutoDetect,
+                    SessionStateMode.InProc, false);
+                SessionStateUtility.AddHttpSessionStateToContext(context, sessionContainer);
+
+                var contextBase = new HttpContextWrapper(context);
+                var routeData = System.Web.Routing.RouteTable.Routes.GetRouteData(contextBase);
+
+                // We shouldn't have to do this, but the way we are mocking the request doesn't seem to pass the querystring data through to the route data.
+                foreach (string key in request.QueryString.Keys)
+                {
+                    if (!routeData.Values.ContainsKey(key))
+                    {
+                        routeData.Values.Add(key, request.QueryString[key]);
+                    }
+                }
+
+                request.RequestContext.RouteData = routeData;
+                request.RequestContext.HttpContext = contextBase;
+
+                var httpHandler = routeData.RouteHandler.GetHttpHandler(request.RequestContext);
+                var oldContext = HttpContext.Current;
+                try
+                {
+                    HttpContext.Current = context;
+                    httpHandler.ProcessRequest(context);
+                }
+                finally
+                {
+                    HttpContext.Current = oldContext;
+                }
             }
         }
     }
