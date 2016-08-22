@@ -30,7 +30,7 @@ namespace EPiServer.Warmup
         private void Context_BeginRequest(object sender, EventArgs e)
         {
             var app = sender as HttpApplication;
-            if (app.Request.UserAgent == "AlwaysOn")
+            if (app.Request.UserAgent == "AlwaysOn" || app.Request.UserAgent == "SiteWarmup")
             {
                 if (Interlocked.CompareExchange(ref _started, DateTime.Now, null)== null)
                 {
